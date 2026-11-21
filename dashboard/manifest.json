@@ -1,0 +1,11 @@
+{
+  "name": "todo-board",
+  "label": "Todo",
+  "description": "Personal todo board — one list everywhere",
+  "icon": "ListTodo",
+  "version": "0.1.0",
+  "tab": { "path": "/todo", "position": "after:skills" },
+  "entry": "index.js",
+  "css": "style.css",
+  "api": "plugin_api.py"
+}

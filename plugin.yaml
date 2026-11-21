@@ -1,0 +1,3 @@
+name: todo-board
+version: 0.1.0
+description: Personal todo board (kanban view) over the todo.md digest file — same list as chat and the morning digest email.
