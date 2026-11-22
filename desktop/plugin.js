@@ -1,16 +1,13 @@
 /**
- * Hermes desktop plugin: Todo Board — kanban pane over the shared todo.md on the backend host.
+ * Hermes desktop plugin: Todo Board — multi-project kanban over ~/Documents/todo/.
  *
- * Remote-friendly variant: the data comes from the todo-board plugin backend
- * already deployed on the gateway host (~/.hermes/plugins/todo-board/) via
- * ctx.rest('/todo') — the same list as the web dashboard tab, chat, and the
- * 7:00 AM digest email. No local files are read or written.
+ * One markdown file per project (personal.md = the human board); an All tab
+ * aggregates every project with color-coded cards. Data flows through the
+ * todo-board plugin backend on the gateway host (ctx.rest '/board') — the same
+ * list as the dashboard tab, chat, and the morning digest email.
  *
  * Install: %USERPROFILE%\.hermes\desktop-plugins\todo-board\plugin.js (Windows)
- * or ~/.hermes/desktop-plugins/todo-board/plugin.js (macOS/Linux), then
- * ⌘K → "Reload desktop plugins".
- *
- * Plain ESM, loaded uncompiled — jsx() calls, not JSX syntax.
+ * or ~/.hermes/desktop-plugins/todo-board/plugin.js, then ⌘K → Reload plugins.
  */
 import {
   PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA,
@@ -21,8 +18,13 @@ import { useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const SECTIONS = ['Now', 'Next', 'Later', 'Done']
+const PALETTE = ['#3b82f6', '#22c55e', '#eab308', '#f97316', '#ef4444', '#a855f7', '#14b8a6', '#ec4899']
+const colorOf = (id) => {
+  let h = 0
+  for (const ch of String(id)) h = (h * 31 + ch.codePointAt(0)) >>> 0
+  return PALETTE[h % PALETTE.length]
+}
 
-// ---------- deadline chip ----------
 const parseDeadline = (text) => {
   const m = /\[by (\d{4}-\d{2}-\d{2})\]/.exec(text || '')
   if (!m) return null
@@ -50,165 +52,208 @@ function DeadlineChip({ text }) {
   })
 }
 
-// ---------- board ----------
-let drag = null
+let drag = null // { project, section, idx }
 
 function Board({ ctx }) {
+  const [tab, setTab] = useState('all')
   const [editing, setEditing] = useState(null)
   const [drafts, setDrafts] = useState({})
+  const [newProj, setNewProj] = useState('')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
 
   const q = useQuery({
-    queryKey: ['todo-board-desktop', 'todo'],
-    queryFn: () => ctx.rest('/todo'),
+    queryKey: ['todo-board-desktop', 'board'],
+    queryFn: () => ctx.rest('/board'),
     refetchInterval: 10000,
     staleTime: 4000
   })
 
   const act = (op) => {
     setBusy(true); setErr('')
-    ctx.rest('/todo', { method: 'POST', body: op })
+    ctx.rest('/board', { method: 'POST', body: op })
       .catch((e) => { setErr(String(e && e.message || e)); host.notify({ kind: 'error', message: 'Todo board write failed' }) })
       .finally(() => { setBusy(false); q.refetch() })
   }
 
   const data = q.data
-  const sections = (data && data.sections) || { Now: [], Next: [], Later: [], Done: [] }
+  const projects = (data && data.projects) || []
+  const active = projects.find((p) => p.id === tab)
 
   if (q.isError && !data) {
     return jsxs('div', { className: 'p-6 text-sm text-(--ui-text-tertiary)', children: [
-      'Todo board backend unreachable (is the server dashboard/gateway up? it serves /api/plugins/todo-board). ',
+      'Todo board backend unreachable (it serves /api/plugins/todo-board on the gateway host). ',
       String(q.error && q.error.message || q.error)
     ] })
   }
 
-  const moveItem = (from, to) => {
+  const moveItem = (pid, from, to) => {
     if (from.section === to.section && from.idx === to.idx) return
     haptic('tap')
-    act({ op: 'move', section: from.section, idx: from.idx, to_section: to.section, to_idx: to.idx })
+    act({ op: 'move', project: pid, section: from.section, idx: from.idx, to_section: to.section, to_idx: to.idx })
   }
+
+  const Card = ({ it, p, section, idx, showProj }) => {
+    const isDone = section === 'Done'
+    const edKey = `${p.id}:${section}:${idx}`
+    return jsxs('div', {
+      draggable: editing !== edKey,
+      onDragStart: (e) => { drag = { project: p.id, section, idx }; e.dataTransfer.effectAllowed = 'move' },
+      onDragEnd: () => { drag = null },
+      onDragOver: (e) => { if (drag && drag.project === p.id) e.preventDefault() },
+      onDrop: (e) => {
+        if (!drag || drag.project !== p.id) return
+        e.preventDefault(); e.stopPropagation()
+        const from = drag; drag = null
+        moveItem(p.id, from, { section, idx })
+      },
+      className: cn('cursor-grab rounded-md border px-2 py-1.5 text-[0.8125rem] leading-snug',
+        'border-(--ui-stroke-secondary) hover:border-(--ui-accent) active:cursor-grabbing'),
+      style: { borderLeft: `3px solid ${p.color}` },
+      children: [
+        jsxs('div', { className: 'flex items-start gap-1.5', children: [
+          jsx('button', {
+            type: 'button',
+            title: isDone ? 'reopen (to Next)' : 'complete (to Done)',
+            className: 'mt-0.5 shrink-0 opacity-60 hover:opacity-100',
+            onClick: () => { haptic('tap'); act({ op: 'complete', project: p.id, section, idx }) },
+            children: jsx(Codicon, { name: isDone ? 'pass-filled' : 'circle-large-outline' })
+          }),
+          showProj ? jsx('span', {
+            className: 'shrink-0 mt-px text-[0.5625rem] font-bold uppercase tracking-wide',
+            style: { color: p.color }, children: p.name
+          }) : null,
+          editing === edKey
+            ? jsx(Input, {
+                autoFocus: true, defaultValue: it.text, className: 'h-6 flex-1 text-[0.8125rem]',
+                onBlur: (e) => { act({ op: 'edit', project: p.id, section, idx, text: e.target.value }); setEditing(null) },
+                onKeyDown: (e) => {
+                  if (e.key === 'Enter') { act({ op: 'edit', project: p.id, section, idx, text: e.currentTarget.value }); setEditing(null) }
+                  if (e.key === 'Escape') setEditing(null)
+                }
+              })
+            : jsx('span', {
+                className: cn('flex-1 break-words', isDone && 'line-through text-(--ui-text-tertiary)'),
+                onDoubleClick: () => { if (!isDone) setEditing(edKey) },
+                children: cleanText(it.text)
+              }),
+          jsx(DeadlineChip, { text: it.text })
+        ] })
+      ]
+    })
+  }
+
+  const Column = ({ section, cards }) => jsx('div', {
+    className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-2',
+    onDragOver: (e) => { if (drag) e.preventDefault() },
+    onDrop: (e) => {
+      if (!drag) return
+      e.preventDefault()
+      const from = drag; drag = null
+      if (active) moveItem(active.id, from, { section, idx: active.sections[section].length })
+    },
+    children: [
+      jsxs('div', { className: 'flex items-center gap-1.5 px-0.5', children: [
+        jsx('span', { className: 'text-[0.6875rem] font-semibold tracking-wide uppercase text-(--ui-text-tertiary)', children: section }),
+        jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: String(cards.length) })
+      ] }),
+      cards.length === 0
+        ? jsx('div', { className: 'rounded-md border border-dashed border-(--ui-stroke-secondary) p-3 text-center text-[0.75rem] text-(--ui-text-quaternary)', children: 'empty' })
+        : jsx('div', { className: 'flex flex-col gap-1.5', children: cards })
+    ]
+  })
+
+  const board = (() => {
+    if (tab === 'all') {
+      return jsx('div', { className: 'flex min-h-0 flex-1 gap-3', children:
+        SECTIONS.map((s) => {
+          const cards = []
+          for (const p of projects) p.sections[s].forEach((it, i) =>
+            cards.push(jsx(Card, { key: `${p.id}:${s}:${i}`, it, p, section: s, idx: i, showProj: true })))
+          return jsx(Column, { key: s, section: s, cards })
+        })
+      })
+    }
+    if (!active) return null
+    return jsx('div', { className: 'flex min-h-0 flex-1 gap-3', children:
+      SECTIONS.map((s) => {
+        const cards = active.sections[s].map((it, i) =>
+          jsx(Card, { key: `${active.id}:${s}:${i}`, it, p: active, section: s, idx: i, showProj: false }))
+        const addBox = s !== 'Done' && jsx(Input, {
+          value: drafts[`${active.id}:${s}`] || '',
+          placeholder: `add to ${s.toLowerCase()}…`,
+          className: 'h-7 text-[0.8125rem]',
+          onChange: (e) => setDrafts((d) => ({ ...d, [`${active.id}:${s}`]: e.currentTarget.value })),
+          onKeyDown: (e) => {
+            const k = `${active.id}:${s}`
+            const v = (drafts[k] || '').trim()
+            if (e.key === 'Enter' && v) { act({ op: 'add', project: active.id, section: s, text: v }); setDrafts((d) => ({ ...d, [k]: '' })) }
+          }
+        })
+        return jsxs(Column, { key: s, section: s, cards: [addBox, ...cards].filter(Boolean) })
+      })
+    })
+  })()
 
   return jsxs('div', { className: 'flex h-full min-h-0 flex-col gap-3 p-4', children: [
     jsxs('div', { className: 'flex flex-wrap items-baseline gap-x-3', children: [
       jsx('span', { className: 'text-sm font-semibold', children: 'Todo' }),
       jsx('span', { className: 'text-[0.75rem] text-(--ui-text-tertiary)', children:
-        data ? `${data.counts.Now} now · ${data.open} open` : 'loading…' }),
-      jsx('span', { className: 'text-[0.75rem] text-(--ui-text-quaternary)', children:
-        '· one list across desktop, dashboard, chat, and the morning digest email · double-click to edit · drag between columns' }),
+        data ? `${data.now} now · ${data.open} open across ${projects.length} project${projects.length === 1 ? '' : 's'}` : 'loading…' }),
       busy ? jsx('span', { className: 'text-[0.75rem] text-(--ui-text-tertiary)', children: '· saving…' }) : null,
       err ? jsx('span', { className: 'text-[0.75rem]', style: { color: 'var(--ui-accent)' }, children: `· ${err}` }) : null
     ] }),
-    jsx(Separator, {}),
-    jsxs('div', { className: 'flex min-h-0 flex-1 gap-3', children:
-      SECTIONS.map((section) => {
-        const items = sections[section] || []
-        const isDone = section === 'Done'
-        return jsxs('div', {
-          className: 'flex min-h-0 min-w-0 flex-1 flex-col gap-2',
-          onDragOver: (e) => { if (drag) e.preventDefault() },
-          onDrop: (e) => {
-            if (!drag) return
-            e.preventDefault()
-            const from = drag; drag = null
-            moveItem(from, { section, idx: items.length })
-          },
-          children: [
-            jsxs('div', { className: 'flex items-center gap-1.5 px-0.5', children: [
-              jsx('span', { className: 'text-[0.6875rem] font-semibold tracking-wide uppercase text-(--ui-text-tertiary)', children: section }),
-              jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: String(items.length) }),
-              (section === 'Now' && items.length > 0)
-                ? jsx('span', { className: 'h-1.5 w-1.5 rounded-full', style: { background: 'var(--ui-accent)' } })
-                : null
-            ] }),
-            !isDone && jsx(Input, {
-              value: drafts[section] || '',
-              placeholder: `add to ${section.toLowerCase()}…`,
-              className: 'h-7 text-[0.8125rem]',
-              onChange: (e) => setDrafts((d) => ({ ...d, [section]: e.currentTarget.value })),
-              onKeyDown: (e) => {
-                const v = (drafts[section] || '').trim()
-                if (e.key === 'Enter' && v) {
-                  act({ op: 'add', section, text: v })
-                  setDrafts((d) => ({ ...d, [section]: '' }))
-                }
-              }
-            }),
-            jsx(ScrollArea, { className: 'min-h-0 flex-1', children:
-              items.length === 0
-                ? jsx('div', { className: 'rounded-md border border-dashed border-(--ui-stroke-secondary) p-3 text-center text-[0.75rem] text-(--ui-text-quaternary)', children: 'empty' })
-                : jsx('div', { className: 'flex flex-col gap-1.5', children:
-                    items.map((it, i) => {
-                      const isDoneItem = section === 'Done'
-                      const edKey = `${section}:${i}`
-                      return jsx('div', {
-                        draggable: editing !== edKey,
-                        onDragStart: (e) => { drag = { section, idx: i }; e.dataTransfer.effectAllowed = 'move' },
-                        onDragEnd: () => { drag = null },
-                        onDragOver: (e) => { if (drag) e.preventDefault() },
-                        onDrop: (e) => {
-                          if (!drag) return
-                          e.preventDefault(); e.stopPropagation()
-                          const from = drag; drag = null
-                          moveItem(from, { section, idx: i })
-                        },
-                        className: cn('cursor-grab rounded-md border px-2 py-1.5 text-[0.8125rem] leading-snug',
-                          'border-(--ui-stroke-secondary) hover:border-(--ui-accent) active:cursor-grabbing'),
-                        children: jsxs('div', { className: 'flex items-start gap-1.5', children: [
-                          jsx('button', {
-                            type: 'button',
-                            title: isDoneItem ? 'reopen (to Next)' : 'complete (to Done)',
-                            className: 'mt-0.5 shrink-0 opacity-60 hover:opacity-100',
-                            onClick: () => { haptic('tap'); act({ op: 'complete', section, idx: i }) },
-                            children: jsx(Codicon, { name: isDoneItem ? 'pass-filled' : 'circle-large-outline' })
-                          }),
-                          editing === edKey
-                            ? jsx(Input, {
-                                autoFocus: true,
-                                defaultValue: it.text,
-                                className: 'h-6 flex-1 text-[0.8125rem]',
-                                onBlur: (e) => { act({ op: 'edit', section, idx: i, text: e.target.value }); setEditing(null) },
-                                onKeyDown: (e) => {
-                                  if (e.key === 'Enter') { act({ op: 'edit', section, idx: i, text: e.currentTarget.value }); setEditing(null) }
-                                  if (e.key === 'Escape') setEditing(null)
-                                }
-                              })
-                            : jsx('span', {
-                                className: cn('flex-1 break-words', isDoneItem && 'line-through text-(--ui-text-tertiary)'),
-                                onDoubleClick: () => { if (!isDoneItem) setEditing(edKey) },
-                                children: cleanText(it.text)
-                              }),
-                          jsx(DeadlineChip, { text: it.text })
-                        ] })
-                      }, edKey)
-                    })
-                  })
-            })
-          ]
-        }, section)
+    jsxs('div', { className: 'flex flex-wrap items-center gap-1.5', children: [
+      jsx('button', {
+        type: 'button',
+        onClick: () => setTab('all'),
+        className: cn('rounded-full border px-2.5 py-0.5 text-[0.75rem] transition-colors',
+          tab === 'all' ? 'border-(--ui-accent) text-(--ui-accent) font-semibold' : 'border-(--ui-stroke-secondary) text-(--ui-text-tertiary)'),
+        children: `All (${data ? data.open : 0})`
+      }),
+      projects.map((p) => jsx('button', {
+        type: 'button',
+        onClick: () => setTab(p.id),
+        className: cn('inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[0.75rem] transition-colors',
+          tab === p.id ? 'font-semibold' : 'border-(--ui-stroke-secondary) text-(--ui-text-tertiary)'),
+        style: tab === p.id ? { borderColor: p.color, color: p.color } : undefined,
+        children: [jsx('span', { key: 'd', className: 'h-1.5 w-1.5 rounded-full', style: { background: p.color } }), `${p.name} (${p.open})`]
+      }, p.id)),
+      jsx(Input, {
+        value: newProj, placeholder: 'new project…', className: 'h-6 w-36 rounded-full text-[0.75rem]',
+        onChange: (e) => setNewProj(e.currentTarget.value),
+        onKeyDown: (e) => {
+          const v = newProj.trim()
+          if (e.key === 'Enter' && v) {
+            const id = v.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+            act({ op: 'create_project', project: id, text: v })
+            setNewProj(''); setTab(id)
+          }
+        }
       })
-    })
+    ] }),
+    jsx(Separator, {}),
+    board
   ] })
 }
 
-// ---------- statusbar chip ----------
 function Chip({ ctx }) {
   const q = useQuery({
     queryKey: ['todo-board-desktop', 'chip'],
-    queryFn: () => ctx.rest('/todo'),
+    queryFn: () => ctx.rest('/board'),
     refetchInterval: 30000,
     staleTime: 10000
   })
   const d = q.data
   return jsx(Tip, {
-    label: 'Todo board — same list as chat and the 7 AM email',
+    label: 'Todo board — one list across desktop, dashboard, chat, and the morning email',
     children: jsxs('button', {
       type: 'button',
       className: 'inline-flex h-full items-center gap-1.5 px-1.5 text-[0.6875rem] text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
       onClick: () => { haptic('tap'); host.navigate('/todo') },
       children: [
         jsx(Codicon, { name: 'checklist' }),
-        d ? `${d.counts.Now} now · ${d.open} open` : 'todo'
+        d ? `${d.now} now · ${d.open} open` : 'todo'
       ]
     })
   })
